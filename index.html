@@ -926,26 +926,93 @@ function addIcLayer(targetMap, layerGroup){
     if(mtPreviewLine){ map.removeLayer(mtPreviewLine); mtPreviewLine = null; }
   }
 
-  /* ---- รายการที่บันทึกแล้ว (วัดระยะ/วัดพื้นที่/หมายเหตุ) — ลบทีละรายการได้ ---- */
-  function mtAddItem(type, layer, label, lat, lng){
+  /* ---- รายการที่บันทึกแล้ว (วัดระยะ/วัดพื้นที่/หมายเหตุ/จุดที่เพิ่ม) — ลบทีละรายการได้ ----
+     เก็บผ่าน kvdb (server กลาง) เพื่อให้ทุกคนในห้องสัมมนาเห็นรายการเดียวกัน */
+  function mtAddItem(type, layer, label, lat, lng, opts){
+    opts = opts || {};
     var id = 'mt'+(mtItemSeq++);
-    layer.addTo(map);
-    mtItems.push({id:id, type:type, layer:layer, label:label, lat:lat, lng:lng});
+    if(!opts.parentGroup) layer.addTo(map); /* ถ้ามี parentGroup แปลว่า layer ถูก add เข้า group นั้นแล้ว ไม่ต้อง add ซ้ำเข้า map ตรงๆ */
+    var kvdbKey = opts.kvdbKey || null;
+    mtItems.push({id:id, type:type, layer:layer, label:label, lat:lat, lng:lng, kvdbKey:kvdbKey, parentGroup:opts.parentGroup||null});
     mtRenderItemList();
+    /* บันทึกลง kvdb อัตโนมัติ ถ้ายังไม่มี key (กรณี add-site จะมี key ส่งมาจากตอน save แล้ว ไม่ต้องบันทึกซ้ำ)
+       และไม่ใช่ระหว่างกำลังโหลดข้อมูลกลับมาแสดง (opts.skipSave) */
+    if(!kvdbKey && !opts.skipSave && opts.geomData){
+      var newKey = 'mtitem_'+(window.crypto&&crypto.randomUUID?crypto.randomUUID().slice(0,10):(Date.now().toString(36)+Math.random().toString(36).slice(2,6)));
+      var record = {type:type, label:label, lat:lat, lng:lng, geom:opts.geomData, ts:Date.now()};
+      fetch(MT_KVDB_BASE+'/'+newKey,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(record)})
+        .then(function(r){ if(r.ok){ var it=mtItems.find(function(x){return x.id===id;}); if(it) it.kvdbKey=newKey; } })
+        .catch(function(){ /* บันทึกขึ้น server ไม่สำเร็จ แต่ยังใช้งานได้ในเครื่องนี้ */ });
+    }
     return id;
   }
   function mtRemoveItem(id){
     var idx = mtItems.findIndex(function(it){ return it.id===id; });
     if(idx<0) return;
-    map.removeLayer(mtItems[idx].layer);
+    var item = mtItems[idx];
+    if(item.parentGroup && item.layer && item.parentGroup.hasLayer && item.parentGroup.hasLayer(item.layer)){
+      item.parentGroup.removeLayer(item.layer);
+    } else {
+      map.removeLayer(item.layer);
+    }
     map.closePopup();
     mtItems.splice(idx,1);
     mtRenderItemList();
+    if(item.kvdbKey){
+      fetch(MT_KVDB_BASE+'/'+item.kvdbKey,{method:'DELETE'}).catch(function(){ /* เงียบไว้ ลบจาก UI ไปแล้ว */ });
+    }
   }
   window._mtRemoveItem = mtRemoveItem;
 
+  /* ---- โหลดรายการที่บันทึกไว้ใน kvdb กลับมาแสดงตอนเปิดหน้าเว็บ (ให้ทุกคนเห็นรายการเดียวกัน) ---- */
+  function mtRebuildLayerFromGeom(type, geom){
+    if(type==='measure-dist'){
+      var pts = geom.points.map(function(p){ return L.latLng(p[0],p[1]); });
+      var lineLayer = L.layerGroup();
+      var line = L.polyline(pts,{color:'#f2a900',weight:2,dashArray:'6 4'});
+      var mid = pts[Math.floor(pts.length/2)];
+      var labelMk = L.marker(mid,{icon:L.divIcon({className:'',html:'<div style="background:#f2a900;color:#0e2e52;font-size:.72rem;font-weight:700;padding:2px 5px;border-radius:4px;font-family:Kanit">'+geom.distLabel+'</div>',iconAnchor:[-4,10]})});
+      lineLayer.addLayer(line); lineLayer.addLayer(labelMk);
+      return {layer:lineLayer, bindTo:line};
+    }
+    if(type==='measure-area'){
+      var pts2 = geom.points.map(function(p){ return L.latLng(p[0],p[1]); });
+      var polyLayer = L.layerGroup();
+      var poly = L.polygon(pts2,{color:'#f2a900',fillColor:'#f2a900',fillOpacity:0.15,weight:2,dashArray:'5 4'});
+      polyLayer.addLayer(poly);
+      return {layer:polyLayer, bindTo:poly};
+    }
+    if(type==='note'){
+      var noteLayer = L.layerGroup();
+      var icon=L.divIcon({className:'',html:'<div style="background:#f2a900;color:#0e2e52;font-family:Kanit;font-size:.72rem;font-weight:700;padding:2px 6px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.3);max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📝 '+geom.text+'</div>',iconAnchor:[0,10]});
+      var mk=L.marker([geom.lat,geom.lng],{icon:icon,draggable:true});
+      noteLayer.addLayer(mk);
+      return {layer:noteLayer, bindTo:mk};
+    }
+    return null;
+  }
+
+  function mtLoadSharedItems(){
+    fetch(MT_KVDB_BASE+'/?prefix=mtitem_&values=true&format=json')
+      .then(function(r){ return r.ok ? r.json() : []; })
+      .then(function(pairs){
+        if(!Array.isArray(pairs)) return;
+        pairs.forEach(function(pair){
+          var key = pair[0], rawVal = pair[1];
+          var rec;
+          try { rec = typeof rawVal==='string' ? JSON.parse(rawVal) : rawVal; } catch(e){ return; }
+          if(!rec || !rec.type || !rec.geom) return;
+          var built = mtRebuildLayerFromGeom(rec.type, rec.geom);
+          if(!built) return;
+          var itemId = mtAddItem(rec.type, built.layer, rec.label, rec.lat, rec.lng, {kvdbKey:key, skipSave:true});
+          if(built.bindTo) built.bindTo.bindPopup('<b>'+mtIconFor(rec.type)+' '+rec.label+'</b>'+mtDeleteBtnHTML(itemId));
+        });
+      })
+      .catch(function(){ /* โหลดไม่สำเร็จ — เริ่มต้นแบบไม่มีรายการเก่าก็ยังใช้งานได้ */ });
+  }
+
   function mtIconFor(type){
-    return {'measure-dist':'📏','measure-area':'⬛','note':'📝'}[type] || '•';
+    return {'measure-dist':'📏','measure-area':'⬛','note':'📝','add-site':'➕'}[type] || '•';
   }
 
   function mtRenderItemList(){
@@ -1058,9 +1125,11 @@ function addIcLayer(targetMap, layerGroup){
               map.removeLayer(tempMk);
               var cfg=getSiteCfg(type);
               var mk=L.marker([lat,lng],{icon:makeSiteIcon(cfg)});
-              mk.bindPopup('<b style="font-size:.92rem">'+name+'</b><br><span style="font-size:.8rem;color:#5b6b7c">'+cfg.icon+' '+type+'</span>');
               var grpKey=siteGroups[type]?type:'อื่นๆ';
-              siteGroups[grpKey].addLayer(mk);
+              var grp = siteGroups[grpKey];
+              grp.addLayer(mk);
+              var itemId = mtAddItem('add-site', mk, name+' ('+type+')', lat, lng, {kvdbKey:key, parentGroup:grp});
+              mk.bindPopup('<b style="font-size:.92rem">'+name+'</b><br><span style="font-size:.8rem;color:#5b6b7c">'+cfg.icon+' '+type+'</span>'+mtDeleteBtnHTML(itemId));
               setTimeout(function(){ map.closePopup(); }, 800);
               mtSetTool(null);
             })
@@ -1087,7 +1156,7 @@ function addIcLayer(targetMap, layerGroup){
           var icon=L.divIcon({className:'',html:'<div style="background:#f2a900;color:#0e2e52;font-family:Kanit;font-size:.72rem;font-weight:700;padding:2px 6px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.3);max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📝 '+txt+'</div>',iconAnchor:[0,10]});
           var mk=L.marker(e.latlng,{icon:icon,draggable:true});
           noteLayer.addLayer(mk);
-          var itemId = mtAddItem('note', noteLayer, txt, e.latlng.lat, e.latlng.lng);
+          var itemId = mtAddItem('note', noteLayer, txt, e.latlng.lat, e.latlng.lng, {geomData:{text:txt, lat:e.latlng.lat, lng:e.latlng.lng}});
           mk.bindPopup('<b>📝 หมายเหตุ</b><br>'+txt+mtDeleteBtnHTML(itemId));
           map.closePopup();
         });
@@ -1144,7 +1213,7 @@ function addIcLayer(targetMap, layerGroup){
       var mid = mtMeasurePoints[Math.floor(mtMeasurePoints.length/2)];
       var labelMk = L.marker(mid,{icon:L.divIcon({className:'',html:'<div style="background:#f2a900;color:#0e2e52;font-size:.72rem;font-weight:700;padding:2px 5px;border-radius:4px;font-family:Kanit">'+dist+'</div>',iconAnchor:[-4,10]})});
       lineLayer.addLayer(line); lineLayer.addLayer(labelMk);
-      var itemId = mtAddItem('measure-dist', lineLayer, 'ระยะทาง '+dist, mid.lat, mid.lng);
+      var itemId = mtAddItem('measure-dist', lineLayer, 'ระยะทาง '+dist, mid.lat, mid.lng, {geomData:{points:mtMeasurePoints.map(function(p){return [p.lat,p.lng];}), distLabel:dist}});
       line.bindPopup('<b>📏 ระยะทาง: '+dist+'</b>'+mtDeleteBtnHTML(itemId));
       document.getElementById('mt-measure-result').textContent='📏 บันทึกแล้ว: '+dist;
     } else if(mtCurrentTool==='measure-area' && mtMeasurePoints.length>=3){
@@ -1159,7 +1228,7 @@ function addIcLayer(targetMap, layerGroup){
       var poly = L.polygon(pts,{color:'#f2a900',fillColor:'#f2a900',fillOpacity:0.15,weight:2,dashArray:'5 4'});
       polyLayer.addLayer(poly);
       var center = poly.getBounds().getCenter();
-      var itemId2 = mtAddItem('measure-area', polyLayer, 'พื้นที่ '+areaStr, center.lat, center.lng);
+      var itemId2 = mtAddItem('measure-area', polyLayer, 'พื้นที่ '+areaStr, center.lat, center.lng, {geomData:{points:pts.map(function(p){return [p.lat,p.lng];})}});
       poly.bindPopup('<b>⬛ พื้นที่: '+areaStr+'</b>'+mtDeleteBtnHTML(itemId2));
       document.getElementById('mt-measure-result').textContent='⬛ บันทึกแล้ว: '+areaStr;
     }
@@ -1167,6 +1236,9 @@ function addIcLayer(targetMap, layerGroup){
   });
 
   map.on('click',function(){document.getElementById('click-info').style.display='none';});
+
+  /* โหลดรายการที่บันทึกร่วมกัน (วัดระยะ/วัดพื้นที่/หมายเหตุ) จาก server กลาง ตอนเปิดหน้าเว็บ */
+  mtLoadSharedItems();
 })();
 </script>
 
